@@ -27,10 +27,11 @@
 # POSSIBILITY OF SUCH DAMAGE.
 ###
 
-import time
+import anydbm
 import Queue
 import random
 import threading
+import time
 
 import supybot.utils as utils
 import supybot.world as world
@@ -52,7 +53,6 @@ class DbmMarkovDB(object):
             db.close()
 
     def _getDb(self, channel):
-        import anydbm
         if channel not in self.dbs:
             filename = plugins.makeChannelFilename(self.filename, channel)
             # To keep the code simpler for addPair, I decided not to make
@@ -140,7 +140,7 @@ class MarkovWorkQueue(threading.Thread):
     def __init__(self, *args, **kwargs):
         name = 'Thread #%s (MarkovWorkQueue)' % world.threadsSpawned
         world.threadsSpawned += 1
-        threading.Thread.__init__(self, name=name)
+        super(MarkovWorkQueue, self).__init__(name=name)
         self.db = MarkovDB(*args, **kwargs)
         self.q = Queue.Queue()
         self.killed = False
@@ -217,23 +217,40 @@ class Markov(callbacks.Plugin):
 
     def _markov(self, channel, irc, word1=None, word2=None, **kwargs):
         def f(db):
+            input_words = [word1, word2]
+            output_words = []
+            for word in [word1, word2]:
+                if not word:
+                    continue
+                word = word.replace("'", "").strip().lstrip()
+                output_words.extend((str(w) for w in word.split(' ') if w))
+
+            # Hack. Always ensure there are at least two elements in the output
+            # words to work on
+            output_words.extend([None, None])
+	    w1, w2 = output_words[:2]
+
             minLength = self.registryValue('minChainLength', channel)
             maxTries = self.registryValue('maxAttempts', channel)
             Random = kwargs.pop('Random', None)
             while maxTries > 0:
                 maxTries -= 1;
-                if word1 and word2:
-                    words = [word1, word2]
-                    resp = [word1]
-                    follower = word2
-                elif word1 or word2:
-                    words = [None, word1 or word2]
+                if w1 and w2:
+                    words = [w1, w2]
+                    resp = [w1]
+                    follower = w2
+                elif w1 or w2:
+                    words = [None, w1 or w2]
                     resp = []
                     follower = words[-1]
                 else:
                     try:
                         # words is of the form [None, word]
+                        # Despite the name, this returns a random first pair,
+                        # not just *the* first pair ever
+                        self.log.info("Defaulting to random")
                         words = list(db.getFirstPair(channel))
+                        self.log.info(str(words))
                         resp = []
                         follower = words[-1]
                     except KeyError:
@@ -250,10 +267,17 @@ class Markov(callbacks.Plugin):
                         (follower, last) = db.getFollower(channel, words[-2],
                                                           words[-1])
                     except KeyError:
-                        irc.error('I found a broken link in the Markov chain. '
-                                  ' Maybe I received two bad links to start '
-                                  'the chain.')
-                        return # ditto here re: Raise
+                        # If I got a bad chain, fall back to random and iterate
+			w1 = w2 = None
+                        resp = []
+			maxTries += 2
+			self.log.info("In here %s %s %s %s" % (w1, w2, maxTries, last))
+			break
+                    except Exception:
+                        irc.error("Something went wrong. Please try again")
+                        self.log.exception("Bot failure")
+                        return
+
                     words.append(follower)
                 if len(resp) >= minLength:
                     irc.reply(' '.join(resp), **kwargs)
@@ -269,6 +293,15 @@ class Markov(callbacks.Plugin):
                                'Markov chain at least %n long.',
                                (minLength, 'word'))
         return f
+
+    def fuck_off(self, irc, msg, args, n, items):
+        def _fuck_off(db, *words):
+            try:
+                irc.reply("Fuck off")
+            except Exception:
+                self.log.exception("Error in 'fuck_off'")
+                irc.error("Ooops, splosions")
+        return _fuck_off
 
     def markov(self, irc, msg, args, channel, word1, word2):
         """[<channel>] [word1 [word2]]
@@ -335,6 +368,15 @@ class Markov(callbacks.Plugin):
                        db.follows(channel), channel))
         self.q.enqueue(follows)
     follows = wrap(follows, ['channeldb'])
+
+    def fuck(self, irc, msg, args, n, items):
+        """[<channel>]
+
+        Swears back at the jerk who sweared at me in <channel>.
+        """
+        f = self.fuck_off(irc, msg, args, n, items)
+        self.q.enqueue(f)
+    fuck = wrap(fuck, ["channeldb", many("anything")])
 
     def stats(self, irc, msg, args, channel):
         """[<channel>]
